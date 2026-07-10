@@ -6,6 +6,7 @@ import { useReaderStore } from '@/store/readerStore';
 import { useSidebarStore } from '@/store/sidebarStore';
 import { useBookDataStore } from '@/store/bookDataStore';
 import { useSettingsStore } from '@/store/settingsStore';
+import { eventDispatcher } from '@/utils/event';
 import { OverlayScrollbarsComponent } from 'overlayscrollbars-react';
 import 'overlayscrollbars/overlayscrollbars.css';
 
@@ -13,6 +14,7 @@ import TOCView from './TOCView';
 import BooknoteView from './BooknoteView';
 import TabNavigation from './TabNavigation';
 import ChatHistoryView from './ChatHistoryView';
+import ImageGenView from './ImageGenView';
 
 const SidebarContent: React.FC<{
   bookDoc: BookDoc;
@@ -31,25 +33,30 @@ const SidebarContent: React.FC<{
 
   useEffect(() => {
     if (!sideBarBookKey) return;
-    const config = getConfig(sideBarBookKey!)!;
-    setActiveTab(config.viewSettings!.sideBarTab!);
+    const cfg = getConfig(sideBarBookKey);
+    const tab = cfg?.viewSettings?.sideBarTab || 'toc';
+    setActiveTab(tab);
+    setTargetTab(tab);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sideBarBookKey]);
 
-  // reset to toc if history tab was active but AI is now disabled
+  // reset to toc if AI tabs were active but AI is now disabled
   useEffect(() => {
-    if ((activeTab === 'history' || targetTab === 'history') && !aiEnabled) {
+    if (!aiEnabled && (activeTab === 'history' || activeTab === 'images')) {
       setActiveTab('toc');
       setTargetTab('toc');
     }
-  }, [aiEnabled, activeTab, targetTab]);
+  }, [aiEnabled, activeTab]);
 
   const handleTabChange = (tab: string) => {
+    // Always allow switching to a tab (including re-selecting for mobile close).
     if (activeTab === tab) {
-      if (isMobile) {
+      if (isMobile && tab !== 'images') {
         setHoveredBookKey(sideBarBookKey);
         setSideBarVisible(false);
       }
+      // Ensure target matches (event may fire before fade completes).
+      setTargetTab(tab);
       return;
     }
 
@@ -66,6 +73,28 @@ const SidebarContent: React.FC<{
     config.viewSettings!.sideBarTab = tab;
   };
 
+  // Open Images tab when Illustrate runs (or other callers dispatch this event).
+  // Avoid setConfig here — mutating config every open can re-render the tree
+  // and re-fire listeners; tab state is local + sideBarTab is written on change.
+  useEffect(() => {
+    const onOpenImages = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { bookKey?: string } | undefined;
+      if (detail?.bookKey && detail.bookKey !== sideBarBookKey) return;
+      setSideBarVisible(true);
+      setActiveTab('images');
+      setTargetTab('images');
+      setFade(false);
+      const cfg = getConfig(sideBarBookKey);
+      if (cfg?.viewSettings && cfg.viewSettings.sideBarTab !== 'images') {
+        cfg.viewSettings.sideBarTab = 'images';
+        setConfig(sideBarBookKey, cfg);
+      }
+    };
+    eventDispatcher.on('sidebar-open-images', onOpenImages);
+    return () => eventDispatcher.off('sidebar-open-images', onOpenImages);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sideBarBookKey]);
+
   return (
     <>
       <div
@@ -76,6 +105,15 @@ const SidebarContent: React.FC<{
       >
         {targetTab === 'history' ? (
           <ChatHistoryView bookKey={sideBarBookKey} />
+        ) : targetTab === 'images' ? (
+          <div
+            className={clsx(
+              'min-h-0 flex-1 transition-opacity duration-300 ease-in-out',
+              fade ? 'opacity-0' : 'opacity-100',
+            )}
+          >
+            <ImageGenView bookKey={sideBarBookKey} />
+          </div>
         ) : (
           <OverlayScrollbarsComponent
             className='min-h-0 flex-1'

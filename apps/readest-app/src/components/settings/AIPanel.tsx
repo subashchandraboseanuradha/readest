@@ -10,7 +10,24 @@ import {
   fetchOpenRouterModels,
   type OpenRouterModelInfo,
 } from '@/services/ai/providers/OpenRouterProvider';
-import { DEFAULT_AI_SETTINGS, GATEWAY_MODELS, MODEL_PRICING } from '@/services/ai/constants';
+import {
+  DEFAULT_AI_SETTINGS,
+  GATEWAY_MODELS,
+  MODEL_PRICING,
+  OPENROUTER_DEFAULTS,
+  OPENROUTER_CHAT_PRESETS,
+  OPENROUTER_EMBED_PRESETS,
+  OPENROUTER_IMAGE_PRESETS,
+  EMBEDDING_VIA_OPENROUTER,
+} from '@/services/ai/constants';
+import {
+  applyKnownProviderToSettings,
+  getKnownProvider,
+  getOpenAICompatibleProviders,
+  resolveKnownProviderFromSettings,
+  type KnownProviderId,
+} from '@/services/ai/knownProviders';
+import { isChatOnlyEmbedHost } from '@/services/ai/embeddingCredentials';
 import type { AISettings, AIProviderName } from '@/services/ai/types';
 import { exportReedyMetricsBundle } from '@/services/reedy/instrumentation';
 import { isTauriAppPlatform } from '@/services/environment';
@@ -96,9 +113,21 @@ const AIPanel: React.FC = () => {
   const [openrouterEmbeddingModel, setOpenrouterEmbeddingModel] = useState(
     aiSettings.openrouterEmbeddingModel ?? '',
   );
+  const [embeddingApiKey, setEmbeddingApiKey] = useState(aiSettings.embeddingApiKey ?? '');
+  const [embeddingBaseUrl, setEmbeddingBaseUrl] = useState(
+    aiSettings.embeddingBaseUrl ?? EMBEDDING_VIA_OPENROUTER.baseUrl,
+  );
+  const [imageGenerationModel, setImageGenerationModel] = useState(
+    aiSettings.imageGenerationModel ?? DEFAULT_AI_SETTINGS.imageGenerationModel ?? '',
+  );
   const [openrouterModels, setOpenrouterModels] = useState<OpenRouterModelInfo[]>([]);
   const [openrouterFetchingModels, setOpenrouterFetchingModels] = useState(false);
   const [openrouterModelsError, setOpenrouterModelsError] = useState('');
+  const [knownEndpointId, setKnownEndpointId] = useState<KnownProviderId>(() =>
+    resolveKnownProviderFromSettings(aiSettings),
+  );
+  const openaiCompatibleProviders = getOpenAICompatibleProviders();
+  const selectedKnownEndpoint = getKnownProvider(knownEndpointId);
 
   const savedCustomModel = aiSettings.aiGatewayCustomModel ?? '';
   const savedModel = aiSettings.aiGatewayModel ?? DEFAULT_AI_SETTINGS.aiGatewayModel ?? '';
@@ -128,19 +157,99 @@ const AIPanel: React.FC = () => {
     settingsRef.current = settings;
   }, [settings]);
 
-  const saveAiSetting = useCallback(
-    async (key: keyof AISettings, value: AISettings[keyof AISettings]) => {
-      const currentSettings = settingsRef.current;
-      if (!currentSettings) return;
-      const currentAiSettings: AISettings = currentSettings.aiSettings ?? DEFAULT_AI_SETTINGS;
-      const newAiSettings: AISettings = { ...currentAiSettings, [key]: value };
-      const newSettings = { ...currentSettings, aiSettings: newAiSettings };
+  /**
+   * One text field powers all OpenAI-compatible hosts (Cerebras, OpenRouter, …).
+   * We keep a session map so switching Known provider restores that host’s key
+   * instead of silently reusing Cerebras’s key against openrouter.ai.
+   */
+  const keysByHostRef = useRef<Record<string, string>>({});
+  const knownEndpointIdRef = useRef(knownEndpointId);
+  knownEndpointIdRef.current = knownEndpointId;
 
-      setSettings(newSettings);
-      await saveSettings(envConfig, newSettings);
+  // Serialize AI saves so concurrent field updates cannot clobber each other
+  // (e.g. base URL write wiping the API key — a common cause of chat 401s).
+  const saveQueueRef = useRef(Promise.resolve());
+
+  const saveAiSettingsPatch = useCallback(
+    (patch: Partial<AISettings>) => {
+      saveQueueRef.current = saveQueueRef.current
+        .then(async () => {
+          const currentSettings = settingsRef.current;
+          if (!currentSettings) return;
+          const currentAiSettings: AISettings = currentSettings.aiSettings ?? DEFAULT_AI_SETTINGS;
+          const newAiSettings: AISettings = { ...currentAiSettings, ...patch };
+          const newSettings = { ...currentSettings, aiSettings: newAiSettings };
+          // Update ref immediately so the next queued save sees the merge.
+          settingsRef.current = newSettings;
+          setSettings(newSettings);
+          await saveSettings(envConfig, newSettings);
+        })
+        .catch((err) => {
+          console.error('[AI settings] save failed', err);
+        });
+      return saveQueueRef.current;
     },
     [envConfig, setSettings, saveSettings],
   );
+
+  const saveAiSetting = useCallback(
+    async (key: keyof AISettings, value: AISettings[keyof AISettings]) => {
+      await saveAiSettingsPatch({ [key]: value } as Partial<AISettings>);
+    },
+    [saveAiSettingsPatch],
+  );
+
+  /** Live snapshot of what chat will use (local form state, not stale store). */
+  const chatConfigSummary = (() => {
+    if (provider === 'ollama') {
+      return {
+        host: ollamaUrl || 'ollama',
+        model: ollamaModel || '—',
+        keyOk: true,
+        mismatch: null as string | null,
+      };
+    }
+    if (provider === 'ai-gateway') {
+      const gwModel =
+        selectedModel === CUSTOM_MODEL_VALUE && customModelStatus === 'valid'
+          ? customModelInput
+          : selectedModel;
+      return {
+        host: 'ai-gateway.vercel.sh',
+        model: gwModel || '—',
+        keyOk: !!gatewayKey.trim(),
+        mismatch: !gatewayKey.trim() ? _('No AI Gateway key entered.') : (null as string | null),
+      };
+    }
+    const host = (() => {
+      try {
+        return new URL(openrouterUrl || OPENROUTER_DEFAULTS.baseUrl).host;
+      } catch {
+        return openrouterUrl || '—';
+      }
+    })();
+    const key = openrouterKey.trim();
+    let mismatch: string | null = null;
+    if (key && host.includes('openrouter') && !key.startsWith('sk-or-')) {
+      mismatch = _(
+        'Key does not look like OpenRouter (sk-or-…). If this is a Cerebras key, choose Known provider “Cerebras Inference” so the base URL is api.cerebras.ai — not openrouter.ai.',
+      );
+    }
+    if (key.startsWith('sk-or-') && host.includes('cerebras')) {
+      mismatch = _(
+        'OpenRouter key (sk-or-…) with Cerebras base URL. Switch Known provider to OpenRouter, or use a Cerebras key.',
+      );
+    }
+    if (!key) {
+      mismatch = _('No API key entered for chat.');
+    }
+    return {
+      host,
+      model: openrouterModel || '—',
+      keyOk: !!key,
+      mismatch,
+    };
+  })();
 
   const fetchOllamaModels = useCallback(async () => {
     if (!ollamaUrl || !enabled) return;
@@ -184,7 +293,11 @@ const AIPanel: React.FC = () => {
       // `name || id` so OpenRouter's friendly labels still show up.
       models.sort((a, b) => a.id.localeCompare(b.id));
       setOpenrouterModels(models);
-      if (models.length > 0 && !models.some((m) => m.id === openrouterModel)) {
+      // Do NOT overwrite the user's model. Auto-pick only when empty.
+      // Overwriting broke Cerebras (gpt-oss-120b) when the list was from a
+      // different host or incomplete, and left chat on openai/gpt-4o-mini
+      // against the wrong base URL.
+      if (!openrouterModel.trim() && models.length > 0) {
         setOpenrouterModel(models[0]!.id);
       }
     } catch (e) {
@@ -288,6 +401,30 @@ const AIPanel: React.FC = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openrouterEmbeddingModel]);
 
+  useEffect(() => {
+    if (!isMounted.current) return;
+    if (embeddingApiKey !== (aiSettings.embeddingApiKey ?? '')) {
+      saveAiSetting('embeddingApiKey', embeddingApiKey);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [embeddingApiKey]);
+
+  useEffect(() => {
+    if (!isMounted.current) return;
+    if (embeddingBaseUrl !== (aiSettings.embeddingBaseUrl ?? '')) {
+      saveAiSetting('embeddingBaseUrl', embeddingBaseUrl);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [embeddingBaseUrl]);
+
+  useEffect(() => {
+    if (!isMounted.current) return;
+    if (imageGenerationModel !== (aiSettings.imageGenerationModel ?? '')) {
+      saveAiSetting('imageGenerationModel', imageGenerationModel);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [imageGenerationModel]);
+
   // Get the effective model ID to use (either selected or custom)
   const getEffectiveModelId = useCallback(() => {
     if (selectedModel === CUSTOM_MODEL_VALUE && customModelStatus === 'valid') {
@@ -369,6 +506,30 @@ const AIPanel: React.FC = () => {
     setErrorMessage('');
 
     try {
+      // Persist form state first so chat uses the same values as this test.
+      await saveAiSettingsPatch({
+        enabled: true,
+        provider,
+        ollamaBaseUrl: ollamaUrl,
+        ollamaModel,
+        ollamaEmbeddingModel,
+        aiGatewayApiKey: gatewayKey,
+        aiGatewayModel: getEffectiveModelId(),
+        openrouterApiKey: openrouterKey,
+        openrouterBaseUrl: openrouterUrl,
+        openrouterModel,
+        openrouterEmbeddingModel,
+        embeddingApiKey,
+        embeddingBaseUrl,
+        imageGenerationModel,
+      });
+
+      if (chatConfigSummary.mismatch && provider === 'openrouter') {
+        setConnectionStatus('error');
+        setErrorMessage(chatConfigSummary.mismatch);
+        return;
+      }
+
       const effectiveModel = getEffectiveModelId();
       const testSettings: AISettings = {
         ...aiSettings,
@@ -382,6 +543,8 @@ const AIPanel: React.FC = () => {
         openrouterBaseUrl: openrouterUrl,
         openrouterModel,
         openrouterEmbeddingModel,
+        embeddingApiKey,
+        embeddingBaseUrl,
       };
       const aiProvider = getAIProvider(testSettings);
       const isHealthy = await aiProvider.healthCheck();
@@ -392,7 +555,9 @@ const AIPanel: React.FC = () => {
         setErrorMessage(
           provider === 'ollama'
             ? _("Couldn't connect to Ollama. Is it running?")
-            : _('Invalid API key or connection failed'),
+            : _(
+                'Invalid API key or wrong base URL. Cerebras keys need https://api.cerebras.ai/v1; OpenRouter keys (sk-or-…) need https://openrouter.ai/api/v1.',
+              ),
         );
       }
     } catch (error) {
@@ -413,18 +578,57 @@ const AIPanel: React.FC = () => {
         />
       </BoxedList>
 
-      <BoxedList title={_('Provider')} className={disabledSection}>
-        <SettingsRow label={_('Ollama (Local)')} asLabel>
+      {/* Always-visible summary so mismatches are obvious before Test Connection */}
+      {enabled && (
+        <div
+          className={clsx(
+            'rounded-lg border px-3 py-2.5 text-xs leading-relaxed',
+            chatConfigSummary.mismatch
+              ? 'border-error/40 bg-error/10 text-error'
+              : 'border-success/30 bg-success/10 text-base-content',
+          )}
+        >
+          <p className='mb-1 font-medium'>
+            {chatConfigSummary.mismatch ? _('Configuration problem') : _('Active chat configuration')}
+          </p>
+          <p className='text-base-content/80'>
+            {_('Host')}: <code className='text-base-content'>{chatConfigSummary.host}</code>
+            {' · '}
+            {_('Model')}: <code className='text-base-content'>{chatConfigSummary.model}</code>
+            {' · '}
+            {_('Key')}: {chatConfigSummary.keyOk ? _('set') : _('missing')}
+          </p>
+          {chatConfigSummary.mismatch && (
+            <p className='mt-1.5'>{chatConfigSummary.mismatch}</p>
+          )}
+          {!chatConfigSummary.mismatch && provider === 'openrouter' && (
+            <p className='text-base-content/60 mt-1'>
+              {_(
+                'Chat uses this host + key. Book Index may use local keywords or a separate OpenRouter embed key (not Vercel).',
+              )}
+            </p>
+          )}
+        </div>
+      )}
+
+      <BoxedList
+        title={_('Provider')}
+        description={_(
+          'OpenAI-compatible (OpenRouter, Cerebras, …): one key + base URL. AI Gateway is Vercel-only. Ollama is fully local.',
+        )}
+        className={disabledSection}
+      >
+        <SettingsRow label={_('OpenAI-compatible (recommended)')} asLabel>
           <input
             type='radio'
             name='ai-provider'
             className='radio'
-            checked={provider === 'ollama'}
-            onChange={() => setProvider('ollama')}
+            checked={provider === 'openrouter'}
+            onChange={() => setProvider('openrouter')}
             disabled={!enabled}
           />
         </SettingsRow>
-        <SettingsRow label={_('AI Gateway (Cloud)')} asLabel>
+        <SettingsRow label={_('AI Gateway (Vercel)')} asLabel>
           <input
             type='radio'
             name='ai-provider'
@@ -434,13 +638,13 @@ const AIPanel: React.FC = () => {
             disabled={!enabled}
           />
         </SettingsRow>
-        <SettingsRow label={_('OpenAI Compatible')} asLabel>
+        <SettingsRow label={_('Ollama (Local)')} asLabel>
           <input
             type='radio'
             name='ai-provider'
             className='radio'
-            checked={provider === 'openrouter'}
-            onChange={() => setProvider('openrouter')}
+            checked={provider === 'ollama'}
+            onChange={() => setProvider('ollama')}
             disabled={!enabled}
           />
         </SettingsRow>
@@ -539,10 +743,37 @@ const AIPanel: React.FC = () => {
               type='password'
               className='input input-bordered input-sm w-full'
               value={gatewayKey}
-              onChange={(e) => setGatewayKey(e.target.value)}
-              placeholder='vck_...'
+              onChange={(e) => {
+                const v = e.target.value;
+                // OpenRouter keys pasted here → switch provider and migrate key.
+                if (v.trim().startsWith('sk-or-')) {
+                  setOpenrouterKey(v.trim());
+                  setGatewayKey('');
+                  setProvider('openrouter');
+                  if (!openrouterUrl) {
+                    setOpenrouterUrl(OPENROUTER_DEFAULTS.baseUrl);
+                  }
+                  if (!openrouterModel) {
+                    setOpenrouterModel(OPENROUTER_DEFAULTS.chatModel);
+                  }
+                  if (!openrouterEmbeddingModel) {
+                    setOpenrouterEmbeddingModel(OPENROUTER_DEFAULTS.embeddingModel);
+                  }
+                  if (!imageGenerationModel) {
+                    setImageGenerationModel(OPENROUTER_DEFAULTS.imageModel);
+                  }
+                  return;
+                }
+                setGatewayKey(v);
+              }}
+              placeholder='vck_… (Vercel AI Gateway — not sk-or-…)'
               disabled={!enabled}
             />
+            <span className='text-base-content/60 text-xs'>
+              {_(
+                'Must be a Vercel AI Gateway key. OpenRouter keys start with sk-or- — paste those under OpenRouter (recommended) instead; we auto-switch if you paste one here.',
+              )}
+            </span>
           </div>
           <div className='flex flex-col gap-2 pe-4 py-3'>
             <SettingLabel>{_('Model')}</SettingLabel>
@@ -606,34 +837,228 @@ const AIPanel: React.FC = () => {
 
       {provider === 'openrouter' && (
         <BoxedList
-          title={_('OpenAI Compatible Configuration')}
+          title={_('OpenAI-compatible endpoint')}
           description={_(
-            'Bring your own API key for OpenAI or any OpenAI-compatible endpoint. Also works with Together / Groq / vLLM / OpenRouter and other OpenAI-compatible services. The model list is fetched live from the endpoint you configure.',
+            'One “API key” field is shared for the active host. Switching Known provider only changes the base URL and default models — paste that host’s own key. Cerebras and OpenRouter are different accounts/keys.',
           )}
           className={disabledSection}
         >
-          {/* API key */}
+          {/* Known provider catalog */}
+          <div className='flex flex-col gap-2 pe-4 py-3'>
+            <SettingLabel>{_('Known provider')}</SettingLabel>
+            <select
+              className='select select-bordered select-sm bg-base-100 text-base-content w-full'
+              value={knownEndpointId}
+              disabled={!enabled}
+              onChange={(e) => {
+                const id = e.target.value as KnownProviderId;
+                const prevId = knownEndpointIdRef.current;
+                const currentKey = openrouterKey.trim();
+                // Remember key for the host we leave (session only).
+                if (currentKey) {
+                  keysByHostRef.current[prevId] = currentKey;
+                }
+                setKnownEndpointId(id);
+                const known = getKnownProvider(id);
+                if (!known) return;
+                setProvider('openrouter');
+                const patch = applyKnownProviderToSettings(
+                  id,
+                  {
+                    ...DEFAULT_AI_SETTINGS,
+                    ...aiSettings,
+                    provider: 'openrouter',
+                    openrouterApiKey: openrouterKey,
+                    openrouterBaseUrl: openrouterUrl,
+                    openrouterModel,
+                    openrouterEmbeddingModel,
+                    imageGenerationModel,
+                  },
+                  { forceModels: true },
+                );
+                const nextUrl =
+                  patch.openrouterBaseUrl !== undefined
+                    ? patch.openrouterBaseUrl
+                    : openrouterUrl;
+                const nextModel = patch.openrouterModel || openrouterModel;
+                const nextEmbed =
+                  patch.openrouterEmbeddingModel || openrouterEmbeddingModel;
+                const nextImage = patch.imageGenerationModel || imageGenerationModel;
+
+                // Prefer key previously used for this host; otherwise only keep
+                // the current key if it matches the new host’s key style.
+                let nextKey = keysByHostRef.current[id] ?? '';
+                if (!nextKey && currentKey) {
+                  const isOr = currentKey.startsWith('sk-or-');
+                  if (id === 'openrouter') {
+                    nextKey = isOr ? currentKey : '';
+                  } else if (id === 'openai') {
+                    nextKey = currentKey.startsWith('sk-') && !isOr ? currentKey : '';
+                  } else if (id === 'cerebras' || id === 'groq' || id === 'xai') {
+                    // Different accounts — do not reuse an OpenRouter key here
+                    nextKey = isOr ? '' : currentKey;
+                  } else {
+                    nextKey = currentKey;
+                  }
+                }
+
+                if (patch.openrouterBaseUrl !== undefined) {
+                  setOpenrouterUrl(patch.openrouterBaseUrl);
+                }
+                if (patch.openrouterModel) setOpenrouterModel(patch.openrouterModel);
+                if (patch.openrouterEmbeddingModel) {
+                  setOpenrouterEmbeddingModel(patch.openrouterEmbeddingModel);
+                }
+                if (patch.imageGenerationModel) {
+                  setImageGenerationModel(patch.imageGenerationModel);
+                }
+                setOpenrouterKey(nextKey);
+                setOpenrouterModels([]);
+                setConnectionStatus('idle');
+                void saveAiSettingsPatch({
+                  provider: 'openrouter',
+                  openrouterApiKey: nextKey,
+                  openrouterBaseUrl: nextUrl,
+                  openrouterModel: nextModel,
+                  openrouterEmbeddingModel: nextEmbed,
+                  imageGenerationModel: nextImage,
+                });
+              }}
+            >
+              {openaiCompatibleProviders.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.recommended ? `${p.name} (recommended)` : p.name}
+                </option>
+              ))}
+            </select>
+            {selectedKnownEndpoint?.description && (
+              <span className='text-base-content/60 text-xs'>
+                {_(selectedKnownEndpoint.description)}
+              </span>
+            )}
+            <div className='flex flex-wrap gap-3'>
+              {selectedKnownEndpoint?.docsUrl && (
+                <a
+                  href={selectedKnownEndpoint.docsUrl}
+                  target='_blank'
+                  rel='noopener noreferrer'
+                  className={clsx('link text-xs', !enabled && 'pointer-events-none')}
+                >
+                  {_('Inference docs')}
+                </a>
+              )}
+              {selectedKnownEndpoint?.websiteUrl && (
+                <a
+                  href={selectedKnownEndpoint.websiteUrl}
+                  target='_blank'
+                  rel='noopener noreferrer'
+                  className={clsx('link text-xs', !enabled && 'pointer-events-none')}
+                >
+                  {_('Provider website')}
+                </a>
+              )}
+            </div>
+          </div>
+
+          <div className='flex flex-col gap-2 pe-4 py-3'>
+            <button
+              type='button'
+              className='btn btn-primary btn-sm h-9 min-h-0 w-full sm:w-auto'
+              disabled={!enabled}
+              onClick={() => {
+                const id = knownEndpointId;
+                const patch = applyKnownProviderToSettings(
+                  id,
+                  {
+                    ...DEFAULT_AI_SETTINGS,
+                    ...aiSettings,
+                    provider: 'openrouter',
+                    openrouterApiKey: openrouterKey,
+                    openrouterBaseUrl: openrouterUrl,
+                    openrouterModel,
+                    openrouterEmbeddingModel,
+                    imageGenerationModel,
+                  },
+                  { forceModels: true },
+                );
+                if (patch.openrouterBaseUrl) setOpenrouterUrl(patch.openrouterBaseUrl);
+                if (patch.openrouterModel) setOpenrouterModel(patch.openrouterModel);
+                if (patch.openrouterEmbeddingModel) {
+                  setOpenrouterEmbeddingModel(patch.openrouterEmbeddingModel);
+                }
+                if (patch.imageGenerationModel) {
+                  setImageGenerationModel(patch.imageGenerationModel);
+                }
+                // Migrate a mistaken sk-or- key from the Gateway field if present.
+                if (!openrouterKey.trim() && gatewayKey.trim().startsWith('sk-or-')) {
+                  setOpenrouterKey(gatewayKey.trim());
+                  setGatewayKey('');
+                  setKnownEndpointId('openrouter');
+                }
+              }}
+            >
+              {_('Apply recommended models for this provider')}
+            </button>
+            <span className='text-base-content/60 text-xs'>
+              {_(
+                'Fills base URL and known-good chat / embedding / image model ids from the catalog (local, no network).',
+              )}
+            </span>
+          </div>
+
+          {/* API key — one field for the *active* host only */}
           <div className='flex flex-col gap-2 pe-4 py-3'>
             <div className='flex w-full items-center justify-between'>
-              <SettingLabel>{_('API Key')}</SettingLabel>
-              <a
-                href='https://openrouter.ai/keys'
-                target='_blank'
-                rel='noopener noreferrer'
-                className={clsx('link text-xs', !enabled && 'pointer-events-none')}
-              >
-                {_('Get Key')}
-              </a>
+              <SettingLabel>
+                {_('API key for')} {selectedKnownEndpoint?.name || _('this host')}
+              </SettingLabel>
+              {selectedKnownEndpoint?.keysUrl ? (
+                <a
+                  href={selectedKnownEndpoint.keysUrl}
+                  target='_blank'
+                  rel='noopener noreferrer'
+                  className={clsx('link text-xs', !enabled && 'pointer-events-none')}
+                >
+                  {_('Get Key')}
+                </a>
+              ) : null}
             </div>
             <input
               type='password'
               className='input input-bordered input-sm w-full'
               value={openrouterKey}
-              onChange={(e) => setOpenrouterKey(e.target.value)}
-              placeholder='sk-or-...'
+              onChange={(e) => {
+                const v = e.target.value;
+                setOpenrouterKey(v);
+                keysByHostRef.current[knownEndpointIdRef.current] = v.trim();
+                // OpenRouter keys only work on openrouter.ai — switch host to match.
+                if (v.trim().startsWith('sk-or-')) {
+                  setProvider('openrouter');
+                  if (knownEndpointId !== 'openrouter') {
+                    setKnownEndpointId('openrouter');
+                    setOpenrouterUrl(OPENROUTER_DEFAULTS.baseUrl);
+                  }
+                }
+              }}
+              placeholder={
+                knownEndpointId === 'cerebras'
+                  ? _('Cerebras API key from cloud.cerebras.ai')
+                  : selectedKnownEndpoint?.apiKeyPrefixes?.[0]
+                    ? `${selectedKnownEndpoint.apiKeyPrefixes[0]}…`
+                    : 'API key for this host'
+              }
               disabled={!enabled}
               autoComplete='off'
             />
+            <span className='text-base-content/60 text-xs'>
+              {knownEndpointId === 'openrouter'
+                ? _('Must start with sk-or-. This is not your Cerebras key.')
+                : knownEndpointId === 'cerebras'
+                  ? _(
+                      'Cerebras key only. Switching to OpenRouter clears this field so the wrong key is not sent to openrouter.ai.',
+                    )
+                  : _('Paste the API key from the selected provider’s website (each host has its own key).')}
+            </span>
           </div>
 
           {/* Base URL + refresh */}
@@ -643,7 +1068,12 @@ const AIPanel: React.FC = () => {
               <button
                 className='hover:bg-base-200 inline-flex h-7 w-7 items-center justify-center rounded-md transition-colors duration-150'
                 onClick={fetchOpenrouterModelList}
-                disabled={!enabled || openrouterFetchingModels || !openrouterKey}
+                disabled={
+                  !enabled ||
+                  openrouterFetchingModels ||
+                  !openrouterKey ||
+                  selectedKnownEndpoint?.supportsModelsList === false
+                }
                 title={_('Refresh Models')}
                 aria-label={_('Refresh Models')}
               >
@@ -658,15 +1088,20 @@ const AIPanel: React.FC = () => {
               type='text'
               className='input input-bordered input-sm w-full'
               value={openrouterUrl}
-              onChange={(e) => setOpenrouterUrl(e.target.value)}
-              placeholder='https://openrouter.ai/api/v1'
+              onChange={(e) => {
+                setOpenrouterUrl(e.target.value);
+                setKnownEndpointId('custom');
+              }}
+              placeholder={
+                selectedKnownEndpoint?.baseUrl || OPENROUTER_DEFAULTS.baseUrl
+              }
               disabled={!enabled}
             />
           </div>
 
-          {/* Model picker — populated from the endpoint's /models */}
+          {/* Chat / LLM */}
           <div className='flex flex-col gap-2 pe-4 py-3'>
-            <SettingLabel>{_('LLM Model')}</SettingLabel>
+            <SettingLabel>{_('Chat model (LLM)')}</SettingLabel>
             {openrouterModels.length > 0 ? (
               <select
                 className='select select-bordered select-sm bg-base-100 text-base-content w-full'
@@ -681,63 +1116,205 @@ const AIPanel: React.FC = () => {
                 ))}
               </select>
             ) : (
-              // Fallback: free-text input when /models isn't reachable yet,
-              // so the user isn't locked out before refreshing succeeds.
+              <select
+                className='select select-bordered select-sm bg-base-100 text-base-content w-full'
+                value={openrouterModel}
+                onChange={(e) => setOpenrouterModel(e.target.value)}
+                disabled={!enabled}
+              >
+                {(selectedKnownEndpoint?.chatModelPresets?.length
+                  ? selectedKnownEndpoint.chatModelPresets
+                  : OPENROUTER_CHAT_PRESETS
+                ).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            )}
+            {!openrouterModels.length && (
               <input
                 type='text'
                 className='input input-bordered input-sm w-full'
                 value={openrouterModel}
                 onChange={(e) => setOpenrouterModel(e.target.value)}
-                placeholder='openai/gpt-4o-mini'
-                disabled={!enabled}
-              />
-            )}
-            {openrouterModelsError && (
-              <span className='text-error text-xs'>{openrouterModelsError}</span>
-            )}
-            {!openrouterModelsError && !openrouterKey && (
-              <span className='text-base-content/60 text-xs'>
-                {_('Enter an API key, then refresh to load available models.')}
-              </span>
-            )}
-          </div>
-
-          {/* Embedding model — same /models listing as the LLM picker.
-              OpenAI's /v1/models doesn't tag chat vs embedding, so the two
-              selects share one list and the user picks the right one.
-              Falls back to free text when the list isn't loaded yet, so
-              the user can still type a known ID before refreshing. */}
-          <div className='flex flex-col gap-2 pe-4 py-3'>
-            <SettingLabel>{_('Embedding Model')}</SettingLabel>
-            {openrouterModels.length > 0 ? (
-              <select
-                className='select select-bordered select-sm bg-base-100 text-base-content w-full'
-                value={openrouterEmbeddingModel}
-                onChange={(e) => setOpenrouterEmbeddingModel(e.target.value)}
-                disabled={!enabled}
-              >
-                <option value=''>{_('None (disable RAG)')}</option>
-                {openrouterModels.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.name ? `${m.name} (${m.id})` : m.id}
-                  </option>
-                ))}
-              </select>
-            ) : (
-              <input
-                type='text'
-                className='input input-bordered input-sm w-full'
-                value={openrouterEmbeddingModel}
-                onChange={(e) => setOpenrouterEmbeddingModel(e.target.value)}
-                placeholder='openai/text-embedding-3-small'
+                placeholder={OPENROUTER_DEFAULTS.chatModel}
                 disabled={!enabled}
               />
             )}
             <span className='text-base-content/60 text-xs'>
-              {_(
-                'Optional. Leave blank if your endpoint does not support embeddings — chat will still work but RAG features will be unavailable.',
-              )}
+              {_('Used for Chat and for crafting Illustrate prompts (step 1).')}
             </span>
+            {openrouterModelsError && (
+              <span className='text-error text-xs'>{openrouterModelsError}</span>
+            )}
+          </div>
+
+          {/* Embedding / book indexing — clear chat vs search split */}
+          <div className='flex flex-col gap-2 pe-4 py-3'>
+            <SettingLabel>{_('Book indexing (embeddings)')}</SettingLabel>
+            {isChatOnlyEmbedHost(openrouterUrl) ? (
+              <div className='border-base-content/10 bg-base-200/50 rounded-lg border p-3 text-xs leading-relaxed'>
+                <p className='text-base-content mb-1 font-medium'>
+                  {_('Chat and book search use different services')}
+                </p>
+                <ul className='text-base-content/70 list-inside list-disc space-y-1'>
+                  <li>
+                    {_('Chat answers → your current API (e.g. Cerebras). Keep that key above.')}
+                  </li>
+                  <li>
+                    {_(
+                      'Book Index needs embeddings. Cerebras has none — optionally add OpenRouter below (not Vercel).',
+                    )}
+                  </li>
+                  <li>
+                    {_(
+                      'No OpenRouter embed key? Index still works with free local keyword search; chat still uses Cerebras.',
+                    )}
+                  </li>
+                </ul>
+                <p className='text-base-content/70 mt-2'>
+                  {_('Suggested embedding model (via OpenRouter):')}{' '}
+                  <code className='text-base-content'>openai/text-embedding-3-small</code>
+                </p>
+              </div>
+            ) : (
+              <span className='text-base-content/60 text-xs'>
+                {_(
+                  'Used to Index a book for semantic search. Same OpenAI-compatible key as chat when the host supports /embeddings (e.g. OpenRouter, OpenAI).',
+                )}
+              </span>
+            )}
+
+            {isChatOnlyEmbedHost(openrouterUrl) && (
+              <>
+                <div className='flex w-full items-center justify-between pt-1'>
+                  <SettingLabel>{_('OpenRouter API key (embeddings only)')}</SettingLabel>
+                  <a
+                    href={EMBEDDING_VIA_OPENROUTER.keysUrl}
+                    target='_blank'
+                    rel='noopener noreferrer'
+                    className={clsx('link text-xs', !enabled && 'pointer-events-none')}
+                  >
+                    {_('Get OpenRouter key')}
+                  </a>
+                </div>
+                <input
+                  type='password'
+                  className='input input-bordered input-sm w-full'
+                  value={embeddingApiKey}
+                  onChange={(e) => setEmbeddingApiKey(e.target.value)}
+                  placeholder='sk-or-v1-… (optional, for better book search)'
+                  disabled={!enabled}
+                  autoComplete='off'
+                />
+                <input
+                  type='text'
+                  className='input input-bordered input-sm w-full'
+                  value={embeddingBaseUrl}
+                  onChange={(e) => setEmbeddingBaseUrl(e.target.value)}
+                  placeholder={EMBEDDING_VIA_OPENROUTER.baseUrl}
+                  disabled={!enabled}
+                />
+                <span className='text-base-content/60 text-xs'>
+                  {_(
+                    'Optional. OpenRouter only — not Vercel AI Gateway. Leave empty to index with local keywords.',
+                  )}
+                </span>
+              </>
+            )}
+
+            <SettingLabel>{_('Embedding model')}</SettingLabel>
+            <select
+              className='select select-bordered select-sm bg-base-100 text-base-content w-full'
+              value={openrouterEmbeddingModel || OPENROUTER_DEFAULTS.embeddingModel}
+              onChange={(e) => setOpenrouterEmbeddingModel(e.target.value)}
+              disabled={!enabled}
+            >
+              {OPENROUTER_EMBED_PRESETS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+              {openrouterModels
+                .filter((m) => m.id.includes('embed'))
+                .map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.name ? `${m.name} (${m.id})` : m.id}
+                  </option>
+                ))}
+            </select>
+            <input
+              type='text'
+              className='input input-bordered input-sm w-full'
+              value={openrouterEmbeddingModel}
+              onChange={(e) => setOpenrouterEmbeddingModel(e.target.value)}
+              placeholder={OPENROUTER_DEFAULTS.embeddingModel}
+              disabled={!enabled}
+            />
+            <span className='text-base-content/60 text-xs'>
+              {isChatOnlyEmbedHost(openrouterUrl)
+                ? _(
+                    'When using OpenRouter for embeddings, pick openai/text-embedding-3-small (recommended).',
+                  )
+                : _('Recommended on OpenRouter: openai/text-embedding-3-small.')}
+            </span>
+          </div>
+
+          {/* Image */}
+          <div className='flex flex-col gap-2 pe-4 py-3'>
+            <SettingLabel>{_('Image model (Illustrate)')}</SettingLabel>
+            <select
+              className='select select-bordered select-sm bg-base-100 text-base-content w-full'
+              value={imageGenerationModel || OPENROUTER_DEFAULTS.imageModel}
+              onChange={(e) => setImageGenerationModel(e.target.value)}
+              disabled={!enabled}
+            >
+              {OPENROUTER_IMAGE_PRESETS.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+            <input
+              type='text'
+              className='input input-bordered input-sm w-full'
+              value={imageGenerationModel}
+              onChange={(e) => setImageGenerationModel(e.target.value)}
+              placeholder={OPENROUTER_DEFAULTS.imageModel}
+              disabled={!enabled}
+            />
+            <span className='text-base-content/60 text-xs'>
+              {isChatOnlyEmbedHost(openrouterUrl)
+                ? _(
+                    'Illustrate needs an image-capable API (not Cerebras). Uses your OpenRouter embed key above if set, model e.g. google/gemini-2.5-flash-image.',
+                  )
+                : _(
+                    'Illustrate: (1) chat model crafts a visual prompt, (2) this image model renders it. Use an image-capable model on OpenRouter.',
+                  )}
+            </span>
+          </div>
+        </BoxedList>
+      )}
+
+      {provider !== 'openrouter' && (
+        <BoxedList
+          title={_('Image generation')}
+          description={_(
+            'Cite a sentence with the Illustrate toolbar action to generate an image. Uses your AI Gateway key when OpenRouter is not selected.',
+          )}
+          className={disabledSection}
+        >
+          <div className='flex flex-col gap-2 pe-4 py-3'>
+            <SettingLabel>{_('Image generation model')}</SettingLabel>
+            <input
+              type='text'
+              className='input input-bordered input-sm w-full'
+              value={imageGenerationModel}
+              onChange={(e) => setImageGenerationModel(e.target.value)}
+              placeholder='google/gemini-2.5-flash-image'
+              disabled={!enabled}
+            />
           </div>
         </BoxedList>
       )}

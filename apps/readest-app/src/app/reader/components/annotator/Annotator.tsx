@@ -90,6 +90,9 @@ import {
   convertMrexptEntriesToBookNotes,
   mergeImportedBookNotes,
 } from '@/services/annotation/providers/mrexpt';
+import { generateImageFromCitation } from '@/services/ai/imageGeneration';
+import { DEFAULT_AI_SETTINGS } from '@/services/ai/constants';
+import { useImageGenStore } from '@/store/imageGenStore';
 
 const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
   bookKey,
@@ -111,7 +114,11 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
   const getViewSettings = useReaderStore((s) => s.getViewSettings);
   const { setNotebookVisible, setNotebookNewAnnotation, setNotebookNewHighlightId } =
     useNotebookStore();
-  const { clearBooknotesNav } = useSidebarStore();
+  const { clearBooknotesNav, setSideBarVisible } = useSidebarStore();
+  const imageGenAdd = useImageGenStore((s) => s.addItem);
+  const imageGenSetLoading = useImageGenStore((s) => s.setLoading);
+  const imageGenSetStage = useImageGenStore((s) => s.setStage);
+  const imageGenSetError = useImageGenStore((s) => s.setError);
   const { listenToNativeTouchEvents } = useDeviceControlStore();
   const { loadCustomDictionaries } = useCustomDictionaryStore();
   const { selectFiles } = useFileSelector(appService, _);
@@ -159,6 +166,7 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
   const [showExportDialog, setShowExportDialog] = useState(false);
   const [showImportDialog, setShowImportDialog] = useState(false);
   const [importingMrexpt, setImportingMrexpt] = useState(false);
+
   // "Clear Annotations" confirm dialog. Hosted here (and not in BookMenu)
   // because the menu unmounts the moment the user picks the entry, which
   // would otherwise tear down the dialog state immediately.
@@ -1339,6 +1347,41 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
     }
   };
 
+  const handleIllustrate = () => {
+    if (!selection || !selection.text?.trim()) return;
+    const text = selection.text.trim();
+    const cfi = selection.cfi;
+    const bookHash = bookKey.split('-')[0] || '';
+    setShowAnnotPopup(false);
+    view?.deselect();
+
+    // Open sidebar Image studio workspace
+    setSideBarVisible(true);
+    eventDispatcher.dispatch('sidebar-open-images', { bookKey });
+
+    void (async () => {
+      imageGenSetLoading(bookHash, true);
+      imageGenSetStage(bookHash, 'crafting');
+      imageGenSetError(bookHash, null);
+      try {
+        const aiSettings = settings.aiSettings ?? DEFAULT_AI_SETTINGS;
+        const result = await generateImageFromCitation({
+          selectionText: text,
+          bookTitle: bookData.book?.title,
+          author: bookData.book?.author,
+          settings: aiSettings,
+          onStage: (s) => imageGenSetStage(bookHash, s),
+        });
+        imageGenAdd(bookHash, result, cfi);
+      } catch (e) {
+        imageGenSetError(bookHash, e instanceof Error ? e.message : String(e));
+      } finally {
+        imageGenSetLoading(bookHash, false);
+        imageGenSetStage(bookHash, null);
+      }
+    })();
+  };
+
   const handleStartEditAnnotation = useCallback(() => {
     setShowAnnotPopup(false);
   }, []);
@@ -1681,6 +1724,12 @@ const Annotator: React.FC<{ bookKey: string; contentInsets: Insets }> = ({
           Icon,
           onClick: handleProofread,
           disabled: bookData.book?.format !== 'EPUB',
+        };
+      case 'illustrate':
+        return {
+          tooltipText: _(label),
+          Icon,
+          onClick: handleIllustrate,
         };
       case 'share':
         return { tooltipText: _(label), Icon, onClick: handleShare };

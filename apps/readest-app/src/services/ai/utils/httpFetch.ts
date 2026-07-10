@@ -17,9 +17,10 @@ import { isTauriAppPlatform } from '@/services/environment';
  * expose a single helper so every provider goes through the same
  * decision rather than each file re-implementing the platform check.
  *
- * For web builds (no Tauri runtime) we fall back to `window.fetch` and
- * rely on the upstream server to send the right `Access-Control-Allow-*`
- * headers — there is no alternative in that environment.
+ * For web builds (no Tauri runtime) we use the global `fetch`:
+ *  - Browser: window/globalThis.fetch (CORS still applies)
+ *  - Next.js API routes / Node: globalThis.fetch (no `window` — using
+ *    `window.fetch` here caused "window is not defined" in Image studio)
  */
 export const getAIFetch = (): typeof fetch => {
   if (isTauriAppPlatform()) {
@@ -27,5 +28,14 @@ export const getAIFetch = (): typeof fetch => {
     // providers can take it directly via their `fetch` option.
     return tauriFetch as unknown as typeof fetch;
   }
-  return window.fetch.bind(window);
+  // Prefer globalThis so server-side image/embed/chat proxies work.
+  const g = globalThis as typeof globalThis & { fetch?: typeof fetch };
+  if (typeof g.fetch === 'function') {
+    return g.fetch.bind(g);
+  }
+  // Last resort (very old environments)
+  if (typeof window !== 'undefined' && typeof window.fetch === 'function') {
+    return window.fetch.bind(window);
+  }
+  throw new Error('No fetch implementation available for AI HTTP calls.');
 };

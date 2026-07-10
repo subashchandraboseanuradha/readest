@@ -7,6 +7,8 @@ import type { AISettings, ScoredChunk } from '../types';
 import type { RetrievalBackend } from './retrievalBackend';
 import type { ReedySourceStore } from './reedySourceStore';
 import type { RetrievedChunk } from '@/services/reedy/retrieval/BookRetriever';
+import { streamOpenAICompatibleChatText } from '../utils/openaiCompatibleChat';
+import { OPENROUTER_DEFAULTS } from '../constants';
 
 /**
  * Per-turn metadata the host (AIAssistant) needs to keep in sync with the
@@ -26,37 +28,23 @@ export interface TauriAdapterOptions {
   onTurnStart?: (turnId: string) => void;
 }
 
-async function* streamViaApiRoute(
-  messages: Array<{ role: string; content: string }>,
-  systemPrompt: string,
-  settings: AISettings,
-  abortSignal?: AbortSignal,
-): AsyncGenerator<string> {
-  const response = await fetch('/api/ai/chat', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messages,
-      system: systemPrompt,
-      apiKey: settings.aiGatewayApiKey,
-      model: settings.aiGatewayModel || 'google/gemini-2.5-flash-lite',
-    }),
-    signal: abortSignal,
-  });
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.error || `Chat failed: ${response.status}`);
+function resolveOpenAICompatibleChat(settings: AISettings): {
+  apiKey: string;
+  baseUrl: string;
+  model: string;
+} {
+  const key = (settings.openrouterApiKey || settings.aiGatewayApiKey || '').trim();
+  const base = (settings.openrouterBaseUrl || OPENROUTER_DEFAULTS.baseUrl).replace(/\/+$/, '');
+  const model =
+    settings.openrouterModel?.trim() ||
+    settings.aiGatewayModel?.trim() ||
+    OPENROUTER_DEFAULTS.chatModel;
+  if (!key) {
+    throw new Error(
+      'API key missing. Paste your key in Settings → AI (Cerebras, OpenRouter sk-or-…, OpenAI, etc.) and Test Connection.',
+    );
   }
-
-  const reader = response.body!.getReader();
-  const decoder = new TextDecoder();
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    yield decoder.decode(value, { stream: true });
-  }
+  return { apiKey: key, baseUrl: base, model };
 }
 
 export function createTauriAdapter(getOptions: () => TauriAdapterOptions): ChatModelAdapter {
@@ -74,9 +62,6 @@ export function createTauriAdapter(getOptions: () => TauriAdapterOptions): ChatM
         onTurnStart,
       } = options;
 
-      // A fresh per-turn id so the source store can key this turn's
-      // citations independently of any prior turn. We expose it via
-      // onTurnStart so the UI subscribes before the first stream tick.
       const turnId =
         typeof crypto !== 'undefined' && 'randomUUID' in crypto
           ? crypto.randomUUID()
@@ -101,17 +86,14 @@ export function createTauriAdapter(getOptions: () => TauriAdapterOptions): ChatM
           .join('\n'),
       }));
 
-      const useApiRoute = typeof window !== 'undefined' && settings.provider === 'ai-gateway';
-
       try {
+        if (!settings.enabled) {
+          throw new Error('AI is disabled. Enable it in Settings → AI.');
+        }
+
         let text = '';
 
         if (backend.kind === 'reedy' && backend.buildLookupTool) {
-          // Reedy path: model calls lookupPassage on demand; sources flow
-          // into the store via the tool's onResult hook. We never use the
-          // API route here because the route would need to be extended to
-          // serialize tools — out of scope for MVP. ai-gateway users with
-          // reedy.enabled fall back to direct provider.getModel().
           const provider = getAIProvider(settings);
           const tool = backend.buildLookupTool({
             bookHash,
@@ -133,8 +115,7 @@ export function createTauriAdapter(getOptions: () => TauriAdapterOptions): ChatM
             yield { content: [{ type: 'text', text }] };
           }
         } else {
-          // Legacy IDB path: chunks go into the system prompt before the
-          // first stream tick; no tool calls.
+          // RAG: never let embedding failures break chat (Cerebras has no embed API).
           let chunks: ScoredChunk[] = [];
           if (await backend.isIndexed(bookHash)) {
             try {
@@ -146,23 +127,75 @@ export function createTauriAdapter(getOptions: () => TauriAdapterOptions): ChatM
               aiLogger.chat.context(chunks.length, chunks.map((c) => c.text).join('').length);
               sourceStore.replace(turnId, chunksToRetrieved(chunks));
             } catch (e) {
-              aiLogger.chat.error(`RAG failed: ${(e as Error).message}`);
+              aiLogger.chat.error(`RAG failed (continuing without passages): ${(e as Error).message}`);
+              chunks = [];
             }
           }
 
           const systemPrompt = buildSystemPrompt(bookTitle, authorName, chunks, currentPage);
 
-          if (useApiRoute) {
-            for await (const chunk of streamViaApiRoute(
-              aiMessages,
-              systemPrompt,
-              settings,
-              abortSignal,
-            )) {
+          if (settings.provider === 'openrouter') {
+            // Bypass AI SDK — explicit Bearer (same as a working health check).
+            const creds = resolveOpenAICompatibleChat(settings);
+            aiLogger.provider.init(
+              'openrouter',
+              `chat ${creds.model} @ ${creds.baseUrl}`,
+            );
+            const oaiMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] = [
+              { role: 'system', content: systemPrompt },
+              ...aiMessages
+                .filter((m) => m.role === 'user' || m.role === 'assistant')
+                .map((m) => ({
+                  role: m.role as 'user' | 'assistant',
+                  content: m.content,
+                })),
+            ];
+            for await (const chunk of streamOpenAICompatibleChatText({
+              baseUrl: creds.baseUrl,
+              apiKey: creds.apiKey,
+              model: creds.model,
+              messages: oaiMessages,
+              signal: abortSignal,
+            })) {
               text += chunk;
               yield { content: [{ type: 'text', text }] };
             }
+          } else if (settings.provider === 'ai-gateway') {
+            // Server proxy for Vercel AI Gateway
+            const key = (settings.aiGatewayApiKey || '').trim();
+            if (!key) {
+              throw new Error('AI Gateway API key missing. Settings → AI.');
+            }
+            const response = await fetch('/api/ai/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                messages: aiMessages,
+                system: systemPrompt,
+                apiKey: key,
+                model: settings.aiGatewayModel || 'google/gemini-2.5-flash-lite',
+                provider: 'ai-gateway',
+              }),
+              signal: abortSignal,
+            });
+            if (!response.ok) {
+              const error = await response.json().catch(() => ({ error: 'Unknown error' }));
+              throw new Error(error.error || `Chat failed: ${response.status}`);
+            }
+            const reader = response.body?.getReader();
+            if (!reader) throw new Error('Chat failed: empty response body.');
+            const decoder = new TextDecoder();
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              const chunk = decoder.decode(value, { stream: true });
+              if (chunk) {
+                text += chunk;
+                yield { content: [{ type: 'text', text }] };
+              }
+            }
           } else {
+            // Ollama local
             const provider = getAIProvider(settings);
             const result = streamText({
               model: provider.getModel(),
@@ -174,6 +207,12 @@ export function createTauriAdapter(getOptions: () => TauriAdapterOptions): ChatM
               text += chunk;
               yield { content: [{ type: 'text', text }] };
             }
+          }
+
+          if (!text.trim()) {
+            throw new Error(
+              'Model returned empty reply. Check model id + API key (Settings → AI → Test Connection).',
+            );
           }
         }
 
@@ -212,7 +251,7 @@ function chunksToRetrieved(chunks: ScoredChunk[]): RetrievedChunk[] {
   return chunks.map((c) => ({
     id: c.id,
     bookHash: c.bookHash,
-    cfi: '', // legacy chunks have no CFI; UI in M1.10 hides the link when cfi is empty
+    cfi: '',
     endCfi: '',
     sectionIndex: c.sectionIndex,
     chapterTitle: c.chapterTitle ?? null,

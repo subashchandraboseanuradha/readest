@@ -27,12 +27,28 @@ export interface AISettings {
   aiGatewayCustomModel?: string;
   aiGatewayEmbeddingModel?: string;
 
-  // OpenAI-compatible provider (OpenRouter, Together, Groq, vLLM, ...).
+  // OpenAI-compatible provider (OpenRouter, Together, Groq, Cerebras, vLLM, ...).
   // Default base URL is OpenRouter's, but any compatible endpoint works.
   openrouterApiKey?: string;
   openrouterBaseUrl?: string;
   openrouterModel?: string;
   openrouterEmbeddingModel?: string;
+
+  /**
+   * Optional separate credentials for book indexing (embeddings).
+   * Use when chat host is chat-only (e.g. Cerebras) but you still want
+   * vector search via OpenRouter — not Vercel AI Gateway.
+   * If empty, embeddings reuse the chat key/base when that host supports them,
+   * otherwise indexing falls back to local BM25 keyword search.
+   */
+  embeddingApiKey?: string;
+  embeddingBaseUrl?: string;
+
+  /**
+   * OpenAI-compatible / OpenRouter model id used for cite→image generation
+   * (e.g. google/gemini-2.5-flash-image or a Flux model).
+   */
+  imageGenerationModel?: string;
 
   spoilerProtection: boolean;
   maxContextChunks: number;

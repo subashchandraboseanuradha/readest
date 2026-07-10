@@ -4,10 +4,14 @@ import type { AIProvider, AISettings, AIProviderName } from '../types';
 import { aiLogger } from '../logger';
 import { AI_TIMEOUTS } from '../utils/retry';
 import { getAIFetch } from '../utils/httpFetch';
+import { createProxiedEmbeddingModel } from './ProxiedGatewayEmbedding';
+import { resolveEmbeddingCredentials } from '../embeddingCredentials';
 
-const DEFAULT_BASE_URL = 'https://openrouter.ai/api/v1';
-const DEFAULT_MODEL = 'openai/gpt-4o-mini';
-const DEFAULT_EMBEDDING_MODEL = 'openai/text-embedding-3-small';
+import { OPENROUTER_DEFAULTS } from '../constants';
+
+const DEFAULT_BASE_URL = OPENROUTER_DEFAULTS.baseUrl;
+const DEFAULT_MODEL = OPENROUTER_DEFAULTS.chatModel;
+const DEFAULT_EMBEDDING_MODEL = OPENROUTER_DEFAULTS.embeddingModel;
 
 /**
  * Provider for any OpenAI-compatible /v1/chat/completions endpoint, with
@@ -36,25 +40,27 @@ export class OpenRouterProvider implements AIProvider {
 
   constructor(settings: AISettings) {
     this.settings = settings;
-    if (!settings.openrouterApiKey) {
+    const key = (settings.openrouterApiKey || '').trim();
+    if (!key) {
       throw new Error('OpenRouter API key required');
     }
-    this.apiKey = settings.openrouterApiKey;
+    this.apiKey = key;
     this.baseUrl = (settings.openrouterBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.httpFetch = getAIFetch();
+    // Set Authorization both via apiKey and headers — some SDK/path combos
+    // drop one of them; OpenRouter returns "Missing Authentication header".
     this.client = createOpenAICompatible({
       name: 'openrouter',
       baseURL: this.baseUrl,
       apiKey: this.apiKey,
-      // Optional OpenRouter app attribution. Harmless for other OpenAI-
-      // compatible backends (they ignore unknown headers).
       headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        // OpenRouter app attribution (ignored by other OpenAI-compatible hosts).
         'HTTP-Referer': 'https://readest.com',
         'X-Title': 'Readest',
       },
-      // Route chat completions / embeddings through our environment-aware
-      // fetch so streaming responses bypass the renderer's CORS sandbox
-      // when running inside Tauri.
+      // Route chat completions through our environment-aware fetch so
+      // streaming bypasses the renderer's CORS sandbox in Tauri.
       fetch: this.httpFetch,
     });
     aiLogger.provider.init('openrouter', settings.openrouterModel || DEFAULT_MODEL);
@@ -66,8 +72,40 @@ export class OpenRouterProvider implements AIProvider {
   }
 
   getEmbeddingModel(): EmbeddingModel {
-    const modelId = this.settings.openrouterEmbeddingModel || DEFAULT_EMBEDDING_MODEL;
-    return this.client.textEmbeddingModel(modelId);
+    const creds = resolveEmbeddingCredentials(this.settings);
+
+    if (creds.bm25Only) {
+      throw new Error(
+        'This chat host has no embeddings API. Add an OpenRouter key under “Book indexing (embeddings)” in Settings → AI, or Index will use local keyword search only.',
+      );
+    }
+
+    if (!creds.apiKey) {
+      throw new Error(
+        'No embedding API key. For Cerebras chat, paste an OpenRouter sk-or-… key under Book indexing (embeddings), model openai/text-embedding-3-small. Not Vercel.',
+      );
+    }
+
+    const modelId = (creds.model || DEFAULT_EMBEDDING_MODEL).trim();
+    // OpenRouter expects provider/model ids (e.g. openai/text-embedding-3-small)
+    const normalized =
+      creds.baseUrl.includes('openrouter.ai') && !modelId.includes('/')
+        ? `openai/${modelId}`
+        : modelId.includes('/')
+          ? modelId
+          : modelId;
+
+    // Prefer explicit BYOK POST (Bearer always present).
+    if (typeof window !== 'undefined' || creds.separateFromChat) {
+      return createProxiedEmbeddingModel({
+        apiKey: creds.apiKey,
+        model: normalized,
+        baseUrl: creds.baseUrl,
+      });
+    }
+
+    // Same host as chat — reuse SDK client
+    return this.client.textEmbeddingModel(normalized);
   }
 
   async isAvailable(): Promise<boolean> {

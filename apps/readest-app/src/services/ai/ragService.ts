@@ -5,6 +5,21 @@ import { withRetryAndTimeout, AI_TIMEOUTS, AI_RETRY_CONFIGS } from './utils/retr
 import { getAIProvider } from './providers';
 import { aiLogger } from './logger';
 import type { AISettings, TextChunk, ScoredChunk, EmbeddingProgress, BookIndexMeta } from './types';
+import {
+  isChatOnlyEmbeddingEndpoint,
+  resolveEmbeddingCredentials,
+} from './embeddingCredentials';
+
+export { isChatOnlyEmbeddingEndpoint } from './embeddingCredentials';
+
+function isSoftEmbedFailure(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Any embed auth / host mismatch → continue with local BM25 so Index never
+  // hard-blocks Cerebras-only users with a Vercel upsell error.
+  return /authentication failed|missing authentication|invalid api key|401|403|does not support embeddings|not support embedding|404|not found|Embedding failed|No embedding API key|Cerebras|OpenRouter|chat-only|keyword search/i.test(
+    msg,
+  );
+}
 
 interface SectionItem {
   id: string;
@@ -73,7 +88,7 @@ export async function indexBook(
   }
 
   aiLogger.rag.indexStart(bookHash, title);
-  const provider = getAIProvider(settings);
+  // Resolve provider after we know whether embeddings are needed (BM25-only skips getEmbeddingModel).
   const sections = bookDoc.sections || [];
   const toc = bookDoc.toc || [];
 
@@ -131,36 +146,73 @@ export async function indexBook(
     }
 
     onProgress?.({ current: 0, total: allChunks.length, phase: 'embedding' });
-    const embeddingModelName =
+    let embeddingModelName =
       settings.provider === 'ollama'
         ? settings.ollamaEmbeddingModel
         : settings.provider === 'openrouter'
           ? settings.openrouterEmbeddingModel || 'text-embedding-3-small'
           : settings.aiGatewayEmbeddingModel || 'text-embedding-3-small';
-    aiLogger.embedding.start(embeddingModelName, allChunks.length);
 
-    const texts = allChunks.map((c) => c.text);
-    try {
-      const { embeddings } = await withRetryAndTimeout(
-        () =>
-          embedMany({
-            model: provider.getEmbeddingModel(),
-            values: texts,
-          }),
-        AI_TIMEOUTS.EMBEDDING_BATCH,
-        AI_RETRY_CONFIGS.EMBEDDING,
-      );
+    // Chat-only hosts (Cerebras, …): use separate OpenRouter embed key if set,
+    // otherwise local BM25 so chat still works with only the Cerebras key.
+    const embedCreds =
+      settings.provider === 'openrouter' ? resolveEmbeddingCredentials(settings) : null;
+    const useBm25Only = embedCreds?.bm25Only === true;
 
-      for (let i = 0; i < allChunks.length; i++) {
-        allChunks[i]!.embedding = embeddings[i];
-        state.chunksProcessed = i + 1;
-        state.progress = Math.round(((i + 1) / allChunks.length) * 100);
-      }
+    if (useBm25Only) {
+      embeddingModelName = 'bm25-only';
+      aiLogger.embedding.start(embeddingModelName, allChunks.length);
+      state.chunksProcessed = allChunks.length;
+      state.progress = 100;
       onProgress?.({ current: allChunks.length, total: allChunks.length, phase: 'embedding' });
-      aiLogger.embedding.complete(embeddings.length, allChunks.length, embeddings[0]?.length || 0);
-    } catch (e) {
-      aiLogger.embedding.error('batch', (e as Error).message);
-      throw e;
+      aiLogger.embedding.complete(0, allChunks.length, 0);
+    } else {
+      const provider = getAIProvider(settings);
+      aiLogger.embedding.start(embeddingModelName, allChunks.length);
+      const texts = allChunks.map((c) => c.text);
+      try {
+        const { embeddings } = await withRetryAndTimeout(
+          () =>
+            embedMany({
+              model: provider.getEmbeddingModel(),
+              values: texts,
+            }),
+          AI_TIMEOUTS.EMBEDDING_BATCH,
+          AI_RETRY_CONFIGS.EMBEDDING,
+        );
+
+        for (let i = 0; i < allChunks.length; i++) {
+          allChunks[i]!.embedding = embeddings[i];
+          state.chunksProcessed = i + 1;
+          state.progress = Math.round(((i + 1) / allChunks.length) * 100);
+        }
+        onProgress?.({ current: allChunks.length, total: allChunks.length, phase: 'embedding' });
+        aiLogger.embedding.complete(
+          embeddings.length,
+          allChunks.length,
+          embeddings[0]?.length || 0,
+        );
+      } catch (e) {
+        // Soft fallback: still index with BM25 so chat works on the user's API.
+        if (isSoftEmbedFailure(e)) {
+          aiLogger.embedding.error(
+            'batch',
+            `${(e as Error).message} — continuing with local BM25-only index`,
+          );
+          embeddingModelName = 'bm25-only';
+          state.chunksProcessed = allChunks.length;
+          state.progress = 100;
+          onProgress?.({
+            current: allChunks.length,
+            total: allChunks.length,
+            phase: 'embedding',
+          });
+          aiLogger.embedding.complete(0, allChunks.length, 0);
+        } else {
+          aiLogger.embedding.error('batch', (e as Error).message);
+          throw e;
+        }
+      }
     }
 
     onProgress?.({ current: 0, total: 2, phase: 'indexing' });
@@ -203,23 +255,33 @@ export async function hybridSearch(
   maxPage?: number,
 ): Promise<ScoredChunk[]> {
   aiLogger.search.query(query, maxPage);
-  const provider = getAIProvider(settings);
   let queryEmbedding: number[] | null = null;
 
-  try {
-    // use AI SDK embed with provider's embedding model
-    const { embedding } = await withRetryAndTimeout(
-      () =>
-        embed({
-          model: provider.getEmbeddingModel(),
-          value: query,
-        }),
-      AI_TIMEOUTS.EMBEDDING_SINGLE,
-      AI_RETRY_CONFIGS.EMBEDDING,
-    );
-    queryEmbedding = embedding;
-  } catch {
-    // bm25 only fallback
+  // Only attempt vector query when we have real embed credentials.
+  // Cerebras chat-only → skip embed entirely (prevents 401 spam + broken chat turns).
+  const embedCreds =
+    settings.provider === 'openrouter' ? resolveEmbeddingCredentials(settings) : null;
+  const canEmbed =
+    settings.provider === 'ollama' ||
+    settings.provider === 'ai-gateway' ||
+    (embedCreds && !embedCreds.bm25Only && !!embedCreds.apiKey);
+
+  if (canEmbed) {
+    try {
+      const provider = getAIProvider(settings);
+      const { embedding } = await withRetryAndTimeout(
+        () =>
+          embed({
+            model: provider.getEmbeddingModel(),
+            value: query,
+          }),
+        AI_TIMEOUTS.EMBEDDING_SINGLE,
+        AI_RETRY_CONFIGS.EMBEDDING,
+      );
+      queryEmbedding = embedding;
+    } catch {
+      // BM25-only fallback
+    }
   }
 
   const results = await aiStore.hybridSearch(bookHash, queryEmbedding, query, topK, maxPage);

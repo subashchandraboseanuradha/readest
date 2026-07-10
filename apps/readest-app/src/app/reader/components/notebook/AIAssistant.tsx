@@ -31,6 +31,7 @@ import { isTauriAppPlatform } from '@/services/environment';
 import type { AppService } from '@/types/system';
 import { ReedyAssistant } from '@/services/reedy/ui/ReedyAssistant';
 import type { ReadingContextSnapshot } from '@/services/reedy/tools/builtins/types';
+import { eventDispatcher } from '@/utils/event';
 
 import { Button } from '@/components/ui/button';
 import { Loader2Icon, BookOpenIcon } from 'lucide-react';
@@ -135,8 +136,16 @@ const AIAssistantChat = ({
 
   // create adapter ONCE and keep it stable
   const adapter = useMemo(() => {
-    // eslint-disable-next-line react-hooks/refs -- intentional: we read optionsRef inside a deferred callback, not during render
-    return createTauriAdapter(() => optionsRef.current);
+    // Always read the latest settings from the store (not a stale panel snapshot)
+    // so chat uses the same base URL + key as Settings → AI after saves.
+    return createTauriAdapter(() => {
+      const live = useSettingsStore.getState().settings?.aiSettings;
+      const base = optionsRef.current;
+      return {
+        ...base,
+        settings: live ? { ...base.settings, ...live } : base.settings,
+      };
+    });
   }, []);
 
   // Create history adapter to load/persist messages
@@ -342,6 +351,8 @@ const LegacyAIAssistant = ({ bookKey }: AIAssistantProps) => {
     return selectBackend({ settings: aiSettings, isTauri: isTauriAppPlatform(), legacy, reedy });
   }, [aiSettings, appService]);
 
+  const { createConversation, loadConversations } = useAIChatStore();
+
   // check if book is indexed on mount
   useEffect(() => {
     if (bookHash && backend) {
@@ -356,19 +367,49 @@ const LegacyAIAssistant = ({ bookKey }: AIAssistantProps) => {
     }
   }, [bookHash, backend]);
 
+  // Ensure a conversation exists so messages persist while chatting.
+  useEffect(() => {
+    if (!bookHash || !aiSettings?.enabled || !indexed) return;
+    void (async () => {
+      await loadConversations(bookHash);
+      if (!useAIChatStore.getState().activeConversationId) {
+        await createConversation(bookHash, `Chat about ${bookTitle}`);
+      }
+    })();
+  }, [bookHash, bookTitle, aiSettings?.enabled, indexed, loadConversations, createConversation]);
+
   const handleIndex = useCallback(async () => {
     if (!bookData?.bookDoc || !aiSettings || !backend) return;
+    if (!aiSettings.enabled) {
+      eventDispatcher.dispatch('toast', {
+        type: 'warning',
+        message: _('Enable AI in Settings → AI first.'),
+        timeout: 4000,
+      });
+      return;
+    }
     setIsIndexing(true);
     try {
       await backend.indexBook(bookData.bookDoc, bookHash, { onProgress: setIndexProgress });
       setIndexed(true);
+      eventDispatcher.dispatch('toast', {
+        type: 'info',
+        message: _('Book indexed for AI chat.'),
+        timeout: 3000,
+      });
     } catch (e) {
-      aiLogger.rag.indexError(bookHash, (e as Error).message);
+      const msg = (e as Error).message || 'Index failed';
+      aiLogger.rag.indexError(bookHash, msg);
+      eventDispatcher.dispatch('toast', {
+        type: 'error',
+        message: msg,
+        timeout: 6000,
+      });
     } finally {
       setIsIndexing(false);
       setIndexProgress(null);
     }
-  }, [bookData?.bookDoc, bookHash, aiSettings]);
+  }, [bookData?.bookDoc, bookHash, aiSettings, backend, _]);
 
   const handleResetIndex = useCallback(async () => {
     if (!appService || !backend) return;
@@ -407,6 +448,10 @@ const LegacyAIAssistant = ({ bookKey }: AIAssistantProps) => {
       : 0;
 
   if (!indexed && !isIndexing) {
+    const chatOnly =
+      aiSettings.provider === 'openrouter' &&
+      /cerebras|groq\.com|perplexity|api\.x\.ai/i.test(aiSettings.openrouterBaseUrl || '');
+    const hasEmbedKey = !!(aiSettings.embeddingApiKey || '').trim();
     return (
       <div className='flex h-full flex-col items-center justify-center gap-3 p-4 text-center'>
         <div className='bg-primary/10 rounded-full p-3'>
@@ -415,7 +460,15 @@ const LegacyAIAssistant = ({ bookKey }: AIAssistantProps) => {
         <div>
           <h3 className='text-foreground mb-0.5 text-sm font-medium'>{_('Index This Book')}</h3>
           <p className='text-muted-foreground text-xs'>
-            {_('Enable AI search and chat for this book')}
+            {chatOnly && hasEmbedKey
+              ? _(
+                  'Chat uses Cerebras (or your chat API). Indexing uses your OpenRouter embedding key for smarter search.',
+                )
+              : chatOnly
+                ? _(
+                    'Chat uses your API (e.g. Cerebras). Index builds a free local keyword index — or add OpenRouter embeddings in Settings → AI for better search. Not Vercel.',
+                  )
+                : _('Enable AI search and chat for this book')}
           </p>
         </div>
         <Button onClick={handleIndex} size='sm' className='h-8 text-xs'>
